@@ -1,37 +1,44 @@
 module CLV
 
-export clv_lu
+export clv
 
 using LinearAlgebra
-using DifferentialEquations
 using DynamicalSystems
 using StaticArrays
 
-function _null_vector(A::AbstractMatrix)
-    # The null vector is found using the singular value decomposition.
-    # It corresponds to the right singular vector associated with the smallest singular value.
-    U, S, V = svd(A)
-    return V[:, end]
+# --- QR with positive diagonal, THIN (m×n with n ≪ m) -----------------------
+@inline function _thin_qr_pos(Z::AbstractMatrix)
+    F = qr(Z)                                 # no pivoting
+    m, n = size(Z)
+    Q = Matrix(F.Q)[:, 1:n]                   # thin Q
+    R = Matrix(F.R)[1:n, 1:n]                 # thin R
+    @inbounds for j in 1:n
+        if R[j,j] < 0
+            @views R[j, :] .*= -1
+            @views Q[:, j] .*= -1
+        end
+    end
+    return Q, R
 end
 
 """
-    clv_lu(ds::DynamicalSystem; kwargs...) -> Vector{Matrix{Float64}}
+    clv(ds; nclv, dt, nstore, nspend_att=1000, nspend_fwd=1000, nspend_bkw=1000;
+        reltol=1e-9, abstol=1e-9)
 
-Compute the covariant Lyapunov vectors (CLVs) of a dynamical system `ds` using the LU decomposition method.
+Compute Covariant Lyapunov Vectors for a `DynamicalSystem` `ds` using
+the Ginelli two-pass algorithm.
 
-# Keyword Arguments
-- `nclv::Integer`: The number of covariant Lyapunov vectors to compute.
-- `dt::Real`: The time step for the integration and orthogonalization.
-- `nstore::Integer`: The number of trajectory points where the CLVs are computed and stored.
-- `nspend_att::Integer = 1000`: Number of initial steps to discard to ensure the trajectory is on the attractor.
-- `nspend_fwd::Integer = 1000`: Number of forward steps to align the tangent vectors with the Lyapunov directions.
-- `nspend_bkw::Integer = 1000`: Number of backward steps to align the transposed vectors.
-- `trajectory_interpolant`: A function to interpolate the trajectory for backward integration.
+Returns `(Gamma, Gs, xs, ts)` where:
+- `Gamma[i]::Matrix{Float64}` is `N×nclv`: physical CLVs at stored time `i`.
+- `Gs[i]::Matrix{Float64}` is `N×nclv`: the Gram–Schmidt basis at time `i`.
+- `xs[i]`: state at time `i` (same type as system state).
+- `ts[i]::Float64`: time stamp, spaced by `dt` from the start of the stored window.
 
-# Returns
-- `Gamma::Vector{Matrix{Float64}}`: A vector of matrices. Each matrix `Gamma[i]` is of size `(m, nclv)` and its columns are the `nclv` covariant Lyapunov vectors at the `i`-th point of the stored trajectory.
+Notes:
+- `reltol` and `abstol` are accepted for API compatibility but are not used by
+  `step!` from DynamicalSystems.jl; tolerances are controlled when constructing `ds`.
 """
-function clv_lu(
+function clv(
     ds::DynamicalSystem;
     nclv::Integer,
     dt::Real,
@@ -39,109 +46,88 @@ function clv_lu(
     nspend_att::Integer = 1000,
     nspend_fwd::Integer = 1000,
     nspend_bkw::Integer = 1000,
-    trajectory_interpolant
+    reltol::Real = 1e-9,    # accepted, unused
+    abstol::Real = 1e-9,    # accepted, unused
 )
-    # Get the dimension of the system.
-    m = DynamicalSystems.dimension(ds)
-    if nclv > m
-        error("nclv cannot be larger than the system dimension.")
-    end
+    # --- setup ---------------------------------------------------------------
+    m  = DynamicalSystems.dimension(ds)
+    n  = Int(nclv)
+    n  > m && error("nclv ($n) cannot exceed system dimension ($m).")
 
-    # *** ARRIVE AT THE ATTRACTOR ***
-    # Start with a random initial condition and evolve it to be on the attractor.
-    u0_prototype = DynamicalSystems.get_state(ds)
-    # Create a random u0 of the same type as the system's state vector.
-    u0 = typeof(u0_prototype)(rand(m))
+    # Burn-in to the attractor with a fresh random state
+    u0_proto = DynamicalSystems.get_state(ds)
+    u0 = typeof(u0_proto)(rand(m))
     DynamicalSystems.reinit!(ds, u0)
-    step!(ds, dt * nspend_att)
-
-    # *** PRELIMINARY STAGE ***
-    # Evolve a set of random orthogonal vectors to align them with the forward Lyapunov directions.
-    Q_rand = SMatrix{m, nclv}(rand(m, nclv))
-    Q = qr(Q_rand).Q
-    tangent_integrator = DynamicalSystems.tangent_integrator(ds, Q)
-
-    for _ = 1:nspend_fwd
-        step!(tangent_integrator, dt)
-        Q_new = DynamicalSystems.get_deviations(tangent_integrator)
-        Q = qr(Q_new).Q
-        DynamicalSystems.set_deviations!(tangent_integrator, Q)
+    for _ in 1:nspend_att
+        step!(ds, dt)
     end
 
-    # *** STAGE A-B ***
-    # Evolve forward and store the trajectory and the orthonormalized vectors (PhiMns).
-    traj = Vector{typeof(u0)}(undef, nstore + nspend_bkw)
-    PhiMns = Vector{typeof(Q)}(undef, nstore)
+    # Initialize GS basis for tangent integrator
+    Q0 = u0_proto isa SVector ? SMatrix{m,n}(I) : Matrix{Float64}(I, m, n)
+    tint = DynamicalSystems.tangent_integrator(ds, Q0)
 
-    for i = 1:nstore
-        step!(tangent_integrator, dt)
-        Q_new = DynamicalSystems.get_deviations(tangent_integrator)
-        Q = qr(Q_new).Q
-        DynamicalSystems.set_deviations!(tangent_integrator, Q)
-        traj[i] = DynamicalSystems.get_state(tangent_integrator)
-        PhiMns[i] = Q
+    # --- forward transient: converge GS directions --------------------------
+    for _ in 1:nspend_fwd
+        step!(tint, dt)
+        Z = DynamicalSystems.get_deviations(tint)     # m×n
+        Q, _ = _thin_qr_pos(Z)
+        DynamicalSystems.set_deviations!(tint, Q)
     end
 
-    # *** STAGE B-C ***
-    # Continue evolving the trajectory forward to have points for the backward integration.
-    for i = 1:nspend_bkw
-        step!(tangent_integrator, dt)
-        traj[nstore+i] = DynamicalSystems.get_state(tangent_integrator)
+    # --- continue forward: store R everywhere and Q on the kept window ------
+    total = nstore + nspend_bkw
+    R_hist = Vector{Matrix{Float64}}(undef, total)    # n×n upper-triangular
+    G_hist_keep = Vector{Matrix{Float64}}(undef, nstore)  # m×n
+    x_hist_full = Vector{typeof(u0_proto)}(undef, total)
+    t_hist_full = Vector{Float64}(undef, total)
+
+    for i in 1:total
+        step!(tint, dt)
+        Z = DynamicalSystems.get_deviations(tint)     # J*Q_prev
+        Q, R = _thin_qr_pos(Z)
+        DynamicalSystems.set_deviations!(tint, Q)
+
+        if i <= nstore
+            G_hist_keep[i] = Q
+        end
+        R_hist[i] = R
+        x_hist_full[i] = DynamicalSystems.get_state(tint)
+        t_hist_full[i] = i*dt
     end
 
-    # Create the result array.
+    # --- backward pass on coefficient matrices C ----------------------------
+    C = Matrix{Float64}(I, n, n)  # any nonsingular upper-triangular works
+
+    # discard backward-transient by evolving C back over the tail
+    for i in total:-1:(nstore+1)
+        C = UpperTriangular(R_hist[i]) \ C
+        @inbounds for j in 1:n
+            s = norm(@view C[:, j])
+            C[:, j] ./= s
+        end
+    end
+
+    # now traverse the kept window, assembling physical CLVs V = Q*C
     Gamma = Vector{Matrix{Float64}}(undef, nstore)
+    Gs    = Vector{Matrix{Float64}}(undef, nstore)
+    xs    = Vector{typeof(u0_proto)}(undef, nstore)
+    ts    = Vector{Float64}(undef, nstore)
 
-    if nclv == 1
-        for i = 1:nstore
-            Gamma[i] = PhiMns[i]
+    for i in nstore:-1:1
+        Q = G_hist_keep[i]
+        Gamma[i] = Q * C
+        Gs[i]    = Q
+        xs[i]    = x_hist_full[i]
+        ts[i]    = t_hist_full[i]
+
+        C = UpperTriangular(R_hist[i]) \ C
+        @inbounds for j in 1:n
+            s = norm(@view C[:, j])
+            C[:, j] ./= s
         end
-        return Gamma
     end
 
-    # *** STAGE C-B ***
-    # Evolve a new set of random orthogonal vectors backward in time.
-    # We use a mutable Matrix for the backward pass for compatibility with the in-place ODE solver.
-    Q_rand = rand(m, nclv - 1)
-    Q = Matrix(qr(Q_rand).Q)
-    J = DynamicalSystems.jacobian(ds)
-    p = ds.p0
-
-    # Define the adjoint dynamics using the provided trajectory interpolant.
-    function adjoint_rhs!(du, u, p_ode, t)
-        J_u = J(trajectory_interpolant(t), p, t)
-        mul!(du, -J_u', u)
-    end
-
-    # Set up and solve the backward ODE problem.
-    t_start_bwd = dt * (nstore + nspend_bkw)
-    t_end_bwd = dt * nstore
-    prob_bwd = ODEProblem(adjoint_rhs!, Q, (t_start_bwd, t_end_bwd))
-    # We want to save the solution at each `dt` step of the backward pass.
-    sol_bwd = solve(prob_bwd, Tsit5(), saveat = -dt)
-    
-    # The backward-evolved Q matrices are the time-reversed solution.
-    Q_bwd = reverse(sol_bwd.u)
-
-    # *** STAGE B-A ***
-    # Now, iterate backward through the stored trajectory and compute the CLVs.
-    for i = 1:nstore
-        # The Q matrix for this point is from the backward solution.
-        Q = qr(Q_bwd[i]).Q 
-
-        P = Q' * PhiMns[nstore-i+1]
-        
-        current_gamma = zeros(m, nclv)
-        current_gamma[:, 1] = PhiMns[nstore-i+1][:, 1]
-
-        for j = 2:nclv
-            a = _null_vector(P[1:j - 1, 1:j])
-            current_gamma[:, j] = PhiMns[nstore-i+1][:, 1:j] * a
-        end
-        Gamma[nstore-i+1] = current_gamma
-    end
-
-    return Gamma
+    return Gamma, Gs, xs, ts
 end
 
-end # module CLV
+end # module
