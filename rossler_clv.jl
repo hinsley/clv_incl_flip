@@ -10,7 +10,7 @@ using GLMakie
 using Random
 
 # 1) System
-ds = Systems.lorenz()   # ContinuousDynamicalSystem, N = 3
+ds = Systems.roessler()   # ContinuousDynamicalSystem, N = 3
 
 # 2) Parameters
 nclv       = 3
@@ -39,7 +39,7 @@ println("Done. Stored $(length(Gamma)) samples.")
 
 # 4) Background trajectory for plotting
 u0_s   = xs[1]
-ds_bg  = Systems.lorenz()
+ds_bg  = Systems.roessler()
 DynamicalSystems.reinit!(ds_bg, u0_s)
 
 t_full = ts[end] - ts[1]
@@ -54,7 +54,7 @@ end
 # 5) Plot attractor and CLVs at stored points
 fig = Figure(size=(900, 900))
 ax = Axis3(fig[1,1],
-    title="Lorenz Attractor with Covariant Lyapunov Vectors",
+    title="Rössler Attractor with Covariant Lyapunov Vectors",
     xlabel="x", ylabel="y", zlabel="z",
 )
 
@@ -109,3 +109,5 @@ if scr !== nothing        # VSCode/Pluto may return nothing
 else
     println("Press Enter to exit…"); readline()  # fallback
 end
+
+
