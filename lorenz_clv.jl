@@ -14,12 +14,12 @@ ds = Systems.lorenz()   # ContinuousDynamicalSystem, N = 3
 
 # 2) Parameters
 nclv       = 3
-t_renorm   = 1.0
+t_renorm   = 0.05
 dt_plot    = 1e-2
-nstore     = Int(1e4)
-nspend_att = Int(3e3)
-nspend_fwd = Int(3e4)
-nspend_bkw = Int(3e3)
+nstore     = Int(2e3)
+nspend_att = Int(3e2)
+nspend_fwd = Int(3e3)
+nspend_bkw = Int(3e2)
 
 Random.seed!(0)
 
@@ -32,14 +32,13 @@ Gamma, Gs, xs, ts = clv(ds;
     nspend_att = nspend_att,
     nspend_fwd = nspend_fwd,
     nspend_bkw = nspend_bkw,
-    reltol     = 1e-9,   # accepted by clv for API compatibility
+    reltol     = 1e-9,
     abstol     = 1e-9,
 )
 println("Done. Stored $(length(Gamma)) samples.")
 
 # 4) Background trajectory for plotting
-# Avoid DifferentialEquations here. Use DynamicalSystems step! so types match.
-u0_s   = xs[1]                         # typically an SVector
+u0_s   = xs[1]
 ds_bg  = Systems.lorenz()
 DynamicalSystems.reinit!(ds_bg, u0_s)
 
@@ -59,13 +58,40 @@ ax = Axis3(fig[1,1],
     xlabel="x", ylabel="y", zlabel="z",
 )
 
+# Time series plot of θ(t) below the 3D plot.
+ax2 = Axis(fig[2,1],
+    title="Minimum angle: CLV3 vs span{CLV1,CLV2}",
+    xlabel="t", ylabel="θ (rad)",
+    yticks=0:π/4:π, ytickformat=xs -> ["0", "π/4", "π/2", "3π/4", "π"][1:length(xs)]
+)
+
 lines!(ax, trajectory_dense, linewidth=0.3)
 
-stride     = 200
-scale      = 4.0
+stride     = 20
+scale      = 2.5
 clv_colors = (:red, :orange, :green)
 
 origins = Point3f.(xs[1:stride:end])
+
+# Compute min angle θ(t) between CLV 3 and span{CLV 1, CLV 2}.
+times_rel = [t - ts[1] for t in ts]
+angles = Vector{Float64}(undef, length(Gamma))
+for i in 1:length(Gamma)
+    v1 = Gamma[i][:, 1]
+    v2 = Gamma[i][:, 2]
+    v3 = Gamma[i][:, 3]
+
+    # Orthonormal basis of span{v1, v2} via QR.
+    A = Matrix(hcat(v1, v2))
+    F = qr(A)
+    Q = Matrix(F.Q)[:, 1:2]
+
+    # Projection of v3 onto the plane and corresponding angle.
+    proj_v3 = Q * (Q' * v3)
+    cos_alpha = norm(proj_v3) / norm(v3)
+    cos_alpha = clamp(cos_alpha, 0.0, 1.0)
+    angles[i] = acos(cos_alpha)
+end
 
 for j in 1:nclv
     dirs = [Vec3f(scale .* normalize(Gamma[i][:, j])) for i in 1:stride:length(Gamma)]
@@ -75,6 +101,8 @@ for j in 1:nclv
 end
 
 axislegend(ax)
+
+lines!(ax2, times_rel, angles, color=:blue, linewidth=1.5)
 scr = display(fig)        # returns a GLMakie.Screen in a terminal run
 if scr !== nothing        # VSCode/Pluto may return nothing
     wait(scr)             # blocks until you close the window
