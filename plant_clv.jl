@@ -9,6 +9,7 @@ using .Plant
 using DynamicalSystems
 using LinearAlgebra
 using GLMakie
+using ChaosTools
 using Random
 using StaticArrays
 using OrdinaryDiffEq
@@ -16,9 +17,9 @@ using OrdinaryDiffEq
 # 1) Configurable parameters
 # You can modify `gh` to change the hyperpolarization-activated current conductance (p[4]).
 # You can also modify Δx (p[16]) and ΔCa (p[17]).
-gh = 0.005 # Float64(Plant.default_params[4])
-τh = Float64(Plant.default_params[14])
-ΔCa = -40.0
+gh = 0.002 # Float64(Plant.default_params[4])
+τx = Float64(Plant.default_params[14])
+ΔCa = -35.8
 Δx  = -1.0
 
 # 2) System
@@ -37,7 +38,7 @@ end
 # Update parameters with configured gh (index 4), Δx (index 16), and ΔCa (index 17).
 p = collect(Float64.(Plant.default_params))
 p[4] = gh
-p[14] = τh
+p[14] = τx
 p[16] = Δx
 p[17] = ΔCa
 
@@ -49,12 +50,12 @@ ds = ContinuousDynamicalSystem(Plant.melibeNew!, u0, p; diffeq=(
 
 # 3) Parameters
 nclv       = 6
-t_renorm   = 1e-2
+t_renorm   = 3e-3
 dt_plot    = 1e-2
-nstore     = Int(1e5)
-nspend_att = Int(1e5)
-nspend_fwd = Int(1e5)
-nspend_bkw = Int(1e5)
+nstore     = Int(3e5)
+nspend_att = Int(3e5)
+nspend_fwd = Int(3e5)
+nspend_bkw = Int(3e5)
 
 Random.seed!(0)
 
@@ -100,8 +101,7 @@ ax = Axis3(fig[1,1],
 # Time series plot of θ(t) below the 3D plot.
 ax2 = Axis(fig[2,1],
     title="Minimum angle: span{CLV1, CLV2} vs span{CLV3…6}",
-    xlabel="t", ylabel="θ (rad)",
-    yticks=0:π/4:π, ytickformat=xs -> ["0", "π/4", "π/2", "3π/4", "π"][1:length(xs)]
+    xlabel="t", ylabel="θ (rad)"
 )
 
 # Make the θ(t) subplot shorter and the state-space plot taller.
@@ -145,15 +145,26 @@ unique!(sel_indices)
 # Origins in 3D: (Ca, x, V)
 origins_sel = [Point3f(u[5], u[1], u[6]) for u in (xs[i] for i in sel_indices)]
 
-# 7) Compute subspace angle θ(t): span{Γ₁,Γ₂} vs span{Γ₃,…,Γ₆} in full state space
+# 7) Compute subspace angle θ(t): span{Γ₁,…,Γk} vs span{Γ_{k+1},…,Γ₆} in full state space
+println("Computing Lyapunov spectrum via ChaosTools…")
+ds_for_lyap = deepcopy(ds)
+λs = lyapunovspectrum(ds_for_lyap, 100_000; Ttr = 500_000, Δt = t_renorm)
+println("Lyapunov exponents: ", λs)
+# Compute the largest number of consecutive Lyapunov exponents (starting from the largest) whose sum is positive.
+sorted_λs = sort(λs, rev=true)
+cum_sums = cumsum(sorted_λs)
+dim_cu = findlast(x -> x > 0, cum_sums)
+println("Dim(E^{cu}) = ", dim_cu)
+
+k = dim_cu
 times_rel = [t - ts[1] for t in ts]
 angles = Vector{Float64}(undef, length(Gamma))
 for i in 1:length(Gamma)
-    A = Matrix(Gamma[i][:, 1:2])
-    B = Matrix(Gamma[i][:, 3:6])
+    A = Matrix(Gamma[i][:, 1:k])
+    B = Matrix(Gamma[i][:, (k+1):6])
 
-    QA = Matrix(qr(A).Q)[:, 1:2]
-    QB = Matrix(qr(B).Q)[:, 1:4]
+    QA = Matrix(qr(A).Q)[:, 1:k]
+    QB = Matrix(qr(B).Q)[:, 1:(6-k)]
 
     C = QA' * QB
     svals = svdvals(C)
@@ -189,8 +200,8 @@ axislegend(ax)
 lines!(ax2, times_rel, angles, color=:blue, linewidth=1.5)
 
 scr = display(fig)
-if scr !== nothing
-    wait(scr)
-else
-    println("Press Enter to exit…"); readline()
-end
+# if scr !== nothing
+#     wait(scr)
+# else
+#     println("Press Enter to exit…"); readline()
+# end
